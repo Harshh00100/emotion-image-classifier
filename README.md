@@ -120,6 +120,3 @@ Note: the test split contains only about 14 images, so these numbers are noisy a
 
 Python, TensorFlow / Keras, OpenCV, Pillow, NumPy, Matplotlib
 
-## License
-
-Add a license of your choice (for example MIT) if you want others to reuse the code. Check the licensing of the images before redistributing the dataset.
