@@ -84,7 +84,7 @@ The script will:
 3. Load images and split individual images 70 / 20 / 10 into train / validation / test
 4. Train for up to 30 epochs (batch size 32, seed 42) with early stopping and TensorBoard logging
 5. Save the loss/accuracy curves to `training_performance.png`
-6. Print overall accuracy and per-class precision, recall and F1 on the test set, plus one sample prediction
+6. Print overall accuracy and per-class precision, recall and F1 on the test set
 7. Save the model to `models/imageclassifier.keras`
 
 View the training logs with:
