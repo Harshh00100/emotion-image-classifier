@@ -6,7 +6,7 @@ A small image classifier built with TensorFlow/Keras that predicts the emotion s
 
 ## Features
 
-- Automatic dataset cleanup (removes corrupted and unsupported image files)
+- Safe image validation (reports invalid files; deletion requires an explicit flag)
 - Contact sheet of sample images from each class (`dataset_contact_sheet.jpg`)
 - 70 / 20 / 10 train / validation / test split with a fixed seed
 - Data augmentation (random horizontal flip and rotation)
@@ -20,8 +20,9 @@ A small image classifier built with TensorFlow/Keras that predicts the emotion s
 ```
 emotion-image-classifier/
 ├── image_classifier.py        # 3-class custom CNN: train, evaluate, save model
-├── main.py                    # MobileNetV2 transfer-learning script (see Known issues)
+├── main.py                    # MobileNetV2 transfer-learning script
 ├── predict.py                 # predict the emotion of a single image
+├── gradcam.py                 # Grad-CAM explanation for the custom CNN
 ├── requirements.txt
 ├── dataset_contact_sheet.jpg  # sample images per class (generated)
 ├── training_performance.png   # loss/accuracy curves (generated)
@@ -48,7 +49,7 @@ venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
-> `image_classifier.py` imports `imghdr`, which was removed in Python 3.13. Use Python 3.10 to 3.12.
+Image validation uses Pillow rather than the removed `imghdr` standard-library module, so Python 3.13 is not blocked by that import.
 
 ## Dataset
 
@@ -61,7 +62,7 @@ images/
 └── sad/     # 69 images
 ```
 
-**Warning:** both training scripts permanently **delete** files in `images/` that are corrupted or not valid images. Keep a backup of your data before running them.
+Both training scripts validate supported image files before training. By default, invalid files are reported and training stops without deleting anything. After reviewing the report, use `--delete-invalid` to explicitly remove invalid files with supported image extensions. Non-image files such as `.gitkeep` and unsupported extensions are ignored.
 
 Notes about the data:
 
@@ -78,10 +79,10 @@ python image_classifier.py
 
 The script will:
 
-1. Remove invalid images from `images/`
+1. Validate images in `images/`; invalid files are reported without deletion by default
 2. Save a sample grid to `dataset_contact_sheet.jpg`
-3. Load the data, scale pixels to [0, 1] and split it 70 / 20 / 10 into train / validation / test
-4. Train for 20 epochs (batch size 32, seed 42) with TensorBoard logging
+3. Load images and split individual images 70 / 20 / 10 into train / validation / test
+4. Train for up to 30 epochs (batch size 32, seed 42) with early stopping and TensorBoard logging
 5. Save the loss/accuracy curves to `training_performance.png`
 6. Print overall accuracy and per-class precision, recall and F1 on the test set, plus one sample prediction
 7. Save the model to `models/imageclassifier.keras`
@@ -113,7 +114,7 @@ Prediction: HAPPY (87.12%)
 ===================================
 ```
 
-If you run `python predict.py` without an argument, it predicts the first image in `images/happy/`. The class names (`angry`, `happy`, `sad`) are hard-coded in `predict.py`, so update `CLASS_NAMES` if you change the dataset folders.
+The class names are read from the dataset folders in alphabetical order. Pass `--model models/mobilenetv2_emotion.keras` to use the MobileNetV2 model trained by `main.py`.
 
 ### 3. Transfer learning with MobileNetV2 (`main.py`)
 
@@ -121,7 +122,7 @@ If you run `python predict.py` without an argument, it predicts the first image 
 python main.py
 ```
 
-This script cleans the data, splits it 70 / 20 / 10 per image, and trains a frozen MobileNetV2 backbone with flip/rotation augmentation, dropout, early stopping and best-model checkpointing. See **Known issues** below before relying on it.
+This script validates the data, splits individual images 70 / 20 / 10, and trains a frozen MobileNetV2 backbone with flip/rotation augmentation, dropout, early stopping and best-model checkpointing. It uses a three-class softmax output and saves to `models/mobilenetv2_emotion.keras`.
 
 ## Model architecture
 
@@ -135,10 +136,10 @@ This script cleans the data, splits it 70 / 20 / 10 per image, and trains a froz
 | Conv2D + MaxPooling | 32 filters, 3x3, ReLU |
 | Conv2D + MaxPooling | 16 filters, 3x3, ReLU |
 | GlobalAveragePooling2D | |
-| Dense | 256 units, ReLU |
+| Dense | 128 units, ReLU + Dropout (0.35) |
 | Dense (output) | 3 units, softmax |
 
-Loss: categorical cross-entropy. Optimizer: Adam. Epochs: 20.
+Loss: sparse categorical cross-entropy. Optimizer: Adam. Up to 30 epochs with early stopping.
 
 ### MobileNetV2 transfer learning (`main.py`)
 
@@ -148,9 +149,9 @@ Loss: categorical cross-entropy. Optimizer: Adam. Epochs: 20.
 | Augmentation | RandomFlip (horizontal), RandomRotation (0.1) |
 | Preprocessing | `mobilenet_v2.preprocess_input` |
 | Backbone | MobileNetV2, ImageNet weights, frozen |
-| Head | GlobalAveragePooling2D, Dropout (0.3), Dense (1, sigmoid) |
+| Head | GlobalAveragePooling2D, Dropout (0.4), Dense (3, softmax) |
 
-Optimizer: Adam (learning rate 1e-3). Up to 30 epochs with early stopping on validation loss (patience 5).
+Optimizer: Adam (learning rate 1e-4). Up to 30 epochs with early stopping on validation loss (patience 5).
 
 ## Results
 
@@ -162,20 +163,22 @@ By epoch 20, training accuracy is about 70% and validation accuracy about 80%, w
 
 Because the dataset is tiny and the split is coarse, these numbers are noisy and should be read as a sanity check, not a reliable benchmark.
 
-## Known issues
+## Explain a prediction with Grad-CAM
 
-These are documented here until they are fixed:
+Train the custom CNN first, then create a heatmap for an input image:
 
-- `main.py` uses a single sigmoid output and binary cross-entropy, which does not match the three-class dataset, so its training, evaluation and prediction logic need updating.
-- `main.py` and `image_classifier.py` both write to `models/imageclassifier.keras` and expect different input scaling, and `predict.py` matches only the `image_classifier.py` model.
-- `image_classifier.py` splits the data by batch rather than by image, so the split sizes are approximate.
+```bash
+python image_classifier.py
+python gradcam.py path/to/face.jpg
+```
 
-## Ideas for improvement
+The output is saved beside the input as `face_gradcam.png` (or specify `--output`). The heatmap highlights image regions that most influence the selected class score. It is an explanation aid, not proof that the model learned facial expression rather than dataset shortcuts. Grad-CAM currently supports the custom CNN model; use the default `models/imageclassifier.keras`.
 
-- Fix the issues above and merge the two training scripts into one pipeline
-- Use a stratified split and k-fold cross-validation for a more reliable estimate
-- Add a confusion matrix and Grad-CAM visualisations
-- Use consistent, properly licensed data for all three classes
+## Known limitations
+
+- The dataset contains only about 210 hand-collected images. Metrics are noisy and do not establish real-world accuracy.
+- The current split is randomized per image, not stratified by class or grouped by person/source. Similar images or the same person could appear in multiple splits; use a larger, consistently sourced dataset and subject-aware splitting before drawing strong conclusions.
+- Grad-CAM support currently targets the custom CNN. MobileNetV2 prediction and training are supported, but its nested backbone is not yet wired into the Grad-CAM graph.
 
 ## Tech stack
 
