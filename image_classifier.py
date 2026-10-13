@@ -1,348 +1,210 @@
+import argparse
 import os
-import cv2
-import imghdr
-import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks
+from pathlib import Path
 
-# -----------------------------------------------------------------------------
-# Configuration Constants
-# -----------------------------------------------------------------------------
-DATA_DIR = "images"
-MODELS_DIR = "models"
-LOGS_DIR = "logs"
-MODEL_PATH = os.path.join(MODELS_DIR, "imageclassifier.keras")
-CONTACT_SHEET_PATH = "dataset_contact_sheet.jpg"
-TRAINING_PLOT_PATH = "training_performance.png"
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from PIL import Image, UnidentifiedImageError
+from tensorflow.keras import callbacks, layers, models
+
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "images"
+MODELS_DIR = ROOT_DIR / "models"
+LOGS_DIR = ROOT_DIR / "logs"
+MODEL_PATH = MODELS_DIR / "imageclassifier.keras"
+CONTACT_SHEET_PATH = ROOT_DIR / "dataset_contact_sheet.jpg"
+TRAINING_PLOT_PATH = ROOT_DIR / "training_performance.png"
 
 IMAGE_SIZE = (256, 256)
 BATCH_SIZE = 32
-EPOCHS = 20
+EPOCHS = 30
 SEED = 42
-VALID_IMAGE_EXTENSIONS = ["jpeg", "jpg", "bmp", "png"]
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# -----------------------------------------------------------------------------
-# 1. Image Sanitization & Dataset Validation
-# -----------------------------------------------------------------------------
-def sanitize_image_directory(data_dir):
-    """
-    Scans the dataset directory, removes corrupt or non-decodable images,
-    and ensures valid image extensions.
-    """
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Data directory '{data_dir}' not found.")
 
-    removed_count = 0
-    total_checked = 0
+def validate_images(data_dir: Path, delete_invalid: bool = False) -> list[Path]:
+    """Report invalid image files; delete them only when explicitly requested."""
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
 
-    for root, _, files in os.walk(data_dir):
-        for file in files:
-            file_path = os.path.join(root, file)
-            total_checked += 1
+    invalid_files = []
+    checked = 0
+    for class_dir in sorted(data_dir.iterdir()):
+        if not class_dir.is_dir():
+            continue
+        for path in sorted(class_dir.iterdir()):
+            # Ignore metadata, hidden files, and unsupported extensions rather than
+            # treating them as images (for example, .gitkeep).
+            if not path.is_file() or path.name.startswith(".") or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            checked += 1
             try:
-                ext = imghdr.what(file_path)
-                if ext not in VALID_IMAGE_EXTENSIONS:
-                    print(f"Removing invalid extension: {file_path}")
-                    os.remove(file_path)
-                    removed_count += 1
-                    continue
+                with Image.open(path) as image:
+                    image.verify()
+            except (OSError, ValueError, UnidentifiedImageError) as exc:
+                invalid_files.append(path)
+                print(f"Invalid image: {path} ({exc})")
+                if delete_invalid:
+                    path.unlink()
+                    print(f"Deleted by explicit request: {path}")
 
-                # Verify actual decoding capability with OpenCV
-                img = cv2.imread(file_path)
-                if img is None or img.size == 0:
-                    print(f"Removing unreadable image: {file_path}")
-                    os.remove(file_path)
-                    removed_count += 1
-            except Exception as e:
-                print(f"Error processing {file_path} ({e}). Removing.")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                removed_count += 1
-
-    print(f"Sanitization complete: Checked {total_checked} files, pruned {removed_count} corrupt items.")
+    print(f"Image validation complete: checked {checked}; invalid {len(invalid_files)}.")
+    if invalid_files and not delete_invalid:
+        print("No files were deleted. Review the list above, repair/move files, or rerun with --delete-invalid.")
+    return invalid_files
 
 
-# -----------------------------------------------------------------------------
-# 2. Contact Sheet Generation
-# -----------------------------------------------------------------------------
-def generate_contact_sheet(data_dir, output_path=CONTACT_SHEET_PATH, samples_per_class=4):
-    """
-    Creates a visual contact sheet sampling images from each emotion class.
-    """
-    classes = [d for d in sorted(os.listdir(data_dir)) if os.path.isdir(os.path.join(data_dir, d))]
-    num_classes = len(classes)
-    if num_classes == 0:
-        return
-
-    plt.figure(figsize=(samples_per_class * 3, num_classes * 3))
-
-    plot_idx = 1
-    for cls in classes:
-        cls_dir = os.path.join(data_dir, cls)
-        files = [f for f in os.listdir(cls_dir) if f.lower().endswith(tuple(VALID_IMAGE_EXTENSIONS))]
-        selected_files = files[:samples_per_class]
-
-        for file in selected_files:
-            file_path = os.path.join(cls_dir, file)
-            img = cv2.imread(file_path)
-            if img is not None:
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                plt.subplot(num_classes, samples_per_class, plot_idx)
-                plt.imshow(img_rgb)
-                plt.title(cls)
-                plt.axis("off")
-            plot_idx += 1
-
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-    print(f"Contact sheet saved to: {os.path.abspath(output_path)}")
-
-
-# -----------------------------------------------------------------------------
-# 3. Data Loading & Partitioning Pipeline
-# -----------------------------------------------------------------------------
 def build_datasets():
-    """
-    Loads images dynamically, computes per-class distribution splits,
-    and returns optimized tf.data.Dataset objects.
-    """
-    raw_dataset = tf.keras.utils.image_dataset_from_directory(
-        DATA_DIR,
+    dataset = tf.keras.utils.image_dataset_from_directory(
+        str(DATA_DIR),
         image_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE,
-        label_mode="categorical",
-        shuffle=True,
-        seed=SEED,
+        batch_size=None,
+        label_mode="int",
+        color_mode="rgb",
+        shuffle=False,
+        follow_links=False,
     )
+    class_names = dataset.class_names
+    total = int(tf.data.experimental.cardinality(dataset).numpy())
+    if total < 3:
+        raise ValueError(f"At least 3 valid images are required; found {total}.")
 
-    class_names = raw_dataset.class_names
-    num_classes = len(class_names)
-    print(f"Class names (index order): {class_names}")
+    dataset = dataset.shuffle(total, seed=SEED, reshuffle_each_iteration=False)
+    train_size = int(total * 0.7)
+    val_size = int(total * 0.2)
+    test_size = total - train_size - val_size
 
-    # Normalize pixel channels: [0, 255] -> [0.0, 1.0]
-    scaled_dataset = raw_dataset.map(lambda x, y: (x / 255.0, y))
+    def prepare(ds):
+        return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
-    # Calculate partition boundaries
-    total_batches = len(scaled_dataset)
-    train_size = int(total_batches * 0.7)
-    val_size = int(total_batches * 0.2)
-    test_size = total_batches - train_size - val_size
-
-    train_data = scaled_dataset.take(train_size)
-    val_data = scaled_dataset.skip(train_size).take(val_size)
-    test_data = scaled_dataset.skip(train_size + val_size).take(test_size)
-
-    # Count class totals across splits
-    def count_classes(ds):
-        counts = {cls: 0 for cls in class_names}
-        for _, labels in ds:
-            labels_np = labels.numpy()
-            indices = np.argmax(labels_np, axis=1)
-            for idx in indices:
-                counts[class_names[idx]] += 1
-        return counts
-
-    train_counts = count_classes(train_data)
-    val_counts = count_classes(val_data)
-    test_counts = count_classes(test_data)
-
-    print(f"Total batches: {total_batches} | Train: {train_size} | Validation: {val_size} | Test: {test_size}")
-    print(f"Train class counts:      {train_counts}")
-    print(f"Validation class counts: {val_counts}")
-    print(f"Test class counts:       {test_counts}")
-
-    # Optimize pipeline caching & prefetching
-    autotune = tf.data.AUTOTUNE
-    train_data = train_data.cache().shuffle(1000).prefetch(buffer_size=autotune)
-    val_data = val_data.cache().prefetch(buffer_size=autotune)
-    test_data = test_data.cache().prefetch(buffer_size=autotune)
-
-    return train_data, val_data, test_data, class_names
+    train = prepare(dataset.take(train_size))
+    val = prepare(dataset.skip(train_size).take(val_size))
+    test = prepare(dataset.skip(train_size + val_size).take(test_size))
+    print(f"Images: {total} | train: {train_size}, validation: {val_size}, test: {test_size}")
+    print(f"Class order: {class_names}")
+    return train, val, test, class_names
 
 
-# -----------------------------------------------------------------------------
-# 4. Model Architecture & Compilation
-# -----------------------------------------------------------------------------
-def build_model(num_classes):
-    """
-    Constructs the CNN model with data augmentation and multiclass head.
-    """
+def build_model(num_classes: int):
     model = models.Sequential([
-        # Data Augmentation Layers
-        layers.RandomFlip("horizontal", input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3)),
+        layers.Input(shape=(*IMAGE_SIZE, 3)),
+        layers.Rescaling(1.0 / 255.0),
+        layers.RandomFlip("horizontal"),
         layers.RandomRotation(0.1),
-
-        # Feature Extraction Backbone
-        layers.Conv2D(16, (3, 3), activation="relu"),
+        layers.Conv2D(16, 3, activation="relu", name="conv1"),
         layers.MaxPooling2D(),
-        layers.Conv2D(32, (3, 3), activation="relu"),
+        layers.Conv2D(32, 3, activation="relu", name="conv2"),
         layers.MaxPooling2D(),
-        layers.Conv2D(16, (3, 3), activation="relu"),
+        layers.Conv2D(16, 3, activation="relu", name="last_conv"),
         layers.MaxPooling2D(),
         layers.GlobalAveragePooling2D(),
-
-        # Dense Classifier Head
-        layers.Dense(256, activation="relu"),
-        layers.Dense(num_classes, activation="softmax")
+        layers.Dense(128, activation="relu"),
+        layers.Dropout(0.35),
+        layers.Dense(num_classes, activation="softmax"),
     ])
-
     model.compile(
-        optimizer="adam",
-        loss=tf.keras.losses.CategoricalCrossentropy(),
-        metrics=[tf.keras.metrics.CategoricalAccuracy(name="accuracy")]
+        optimizer=tf.keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+        metrics=["accuracy"],
     )
     return model
 
 
-# -----------------------------------------------------------------------------
-# 5. Training History Plotting
-# -----------------------------------------------------------------------------
-def plot_training_history(history, output_path=TRAINING_PLOT_PATH):
-    """
-    Plots and saves loss and accuracy learning curves across epochs.
-    """
-    acc = history.history.get("accuracy", [])
-    val_acc = history.history.get("val_accuracy", [])
-    loss = history.history.get("loss", [])
-    val_loss = history.history.get("val_loss", [])
-
-    epochs_range = range(1, len(acc) + 1)
-
-    plt.figure(figsize=(12, 5))
-
-    # Accuracy Plot
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs_range, acc, label="Training Accuracy", color="blue")
-    plt.plot(epochs_range, val_acc, label="Validation Accuracy", color="orange")
-    plt.title("Training and Validation Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend(loc="lower right")
-    plt.grid(True)
-
-    # Loss Plot
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs_range, loss, label="Training Loss", color="blue")
-    plt.plot(epochs_range, val_loss, label="Validation Loss", color="orange")
-    plt.title("Training and Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend(loc="upper right")
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-    print(f"Training performance plot saved to: {os.path.abspath(output_path)}")
+def generate_contact_sheet(data_dir: Path, output_path: Path, samples_per_class: int = 4):
+    class_dirs = [p for p in sorted(data_dir.iterdir()) if p.is_dir()]
+    if not class_dirs:
+        print("No class folders found; skipping contact sheet.")
+        return
+    fig, axes = plt.subplots(len(class_dirs), samples_per_class,
+                             figsize=(samples_per_class * 3, len(class_dirs) * 3),
+                             squeeze=False)
+    for row, class_dir in enumerate(class_dirs):
+        files = [p for p in sorted(class_dir.iterdir())
+                 if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        for col in range(samples_per_class):
+            axes[row, col].axis("off")
+            if col >= len(files):
+                continue
+            try:
+                with Image.open(files[col]) as image:
+                    axes[row, col].imshow(image.convert("RGB"))
+                axes[row, col].set_title(class_dir.name)
+            except (OSError, ValueError):
+                axes[row, col].set_title("Unreadable")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"Contact sheet saved to: {output_path}")
 
 
-# -----------------------------------------------------------------------------
-# 6. Evaluation, Metrics & Inference
-# -----------------------------------------------------------------------------
-def evaluate_and_test(model, test_data, class_names):
-    """
-    Calculates overall and per-class precision, recall, and accuracy,
-    then executes single-image test inference.
-    """
-    print("\nTest Results")
-    print("-" * 35)
+def plot_training_history(history, output_path: Path):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for axis, metric, title in [
+        (axes[0], "loss", "Loss"),
+        (axes[1], "accuracy", "Accuracy"),
+    ]:
+        axis.plot(history.history.get(metric, []), label=f"train_{metric}")
+        axis.plot(history.history.get(f"val_{metric}", []), label=f"val_{metric}")
+        axis.set_title(title)
+        axis.set_xlabel("Epoch")
+        axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"Training plot saved to: {output_path}")
 
-    y_true = []
-    y_pred = []
 
+def evaluate_model(model, test_data, class_names):
+    y_true, y_pred = [], []
     for images, labels in test_data:
-        preds = model.predict(images, verbose=0)
-        y_true.extend(np.argmax(labels.numpy(), axis=1))
-        y_pred.extend(np.argmax(preds, axis=1))
-
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-
-    if len(y_true) > 0:
-        overall_accuracy = np.mean(y_true == y_pred)
-        print(f"Overall Accuracy: {overall_accuracy:.4f}")
-        print("\nPer-Class Metrics:")
-
-        for idx, cls in enumerate(class_names):
-            tp = np.sum((y_pred == idx) & (y_true == idx))
-            fp = np.sum((y_pred == idx) & (y_true != idx))
-            fn = np.sum((y_pred != idx) & (y_true == idx))
-
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-            print(f" - {cls:<7s} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f}")
-
-    # Single-image inference test
-    sample_img_path = None
-    for cls in class_names:
-        folder = os.path.join(DATA_DIR, cls)
-        if os.path.isdir(folder):
-            files = [f for f in os.listdir(folder) if f.lower().endswith(tuple(VALID_IMAGE_EXTENSIONS))]
-            if files:
-                sample_img_path = os.path.join(folder, files[0])
-                break
-
-    if sample_img_path:
-        img_raw = cv2.imread(sample_img_path)
-        if img_raw is not None:
-            img_rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
-            img_resized = tf.image.resize(img_rgb, IMAGE_SIZE)
-            img_input = np.expand_dims(img_resized / 255.0, axis=0)
-
-            predictions = model.predict(img_input, verbose=0)[0]
-            predicted_idx = int(np.argmax(predictions))
-            predicted_class = class_names[predicted_idx]
-            confidence = predictions[predicted_idx]
-
-            print("\nSample Test Inference:")
-            print(f"Image:      {sample_img_path}")
-            print(f"Prediction: {predicted_class}")
-            print(f"Confidence: {confidence:.4f}")
-            print("\nProbability Distribution:")
-            for name, prob in zip(class_names, predictions):
-                print(f" - {name:<7s}: {prob * 100:.2f}%")
+        probabilities = model.predict(images, verbose=0)
+        y_true.extend(labels.numpy().astype(int).tolist())
+        y_pred.extend(np.argmax(probabilities, axis=1).tolist())
+    if not y_true:
+        print("Test split is empty; no evaluation metrics available.")
+        return
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    print(f"Test accuracy: {np.mean(y_true == y_pred):.4f}")
+    print("Per-class metrics:")
+    for idx, name in enumerate(class_names):
+        tp = int(np.sum((y_true == idx) & (y_pred == idx)))
+        fp = int(np.sum((y_true != idx) & (y_pred == idx)))
+        fn = int(np.sum((y_true == idx) & (y_pred != idx)))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        print(f"  {name}: precision={precision:.3f}, recall={recall:.3f}, F1={f1:.3f}")
 
 
-# -----------------------------------------------------------------------------
-# 7. Main Execution Pipeline
-# -----------------------------------------------------------------------------
 def main():
-    # 1. Clean data and build contact sheet
-    sanitize_image_directory(DATA_DIR)
-    generate_contact_sheet(DATA_DIR)
+    parser = argparse.ArgumentParser(description="Train the custom emotion CNN.")
+    parser.add_argument("--delete-invalid", action="store_true",
+                        help="Permanently delete invalid supported image files; default is report-only.")
+    args = parser.parse_args()
 
-    # 2. Partition dataset
+    invalid = validate_images(DATA_DIR, delete_invalid=args.delete_invalid)
+    if invalid and not args.delete_invalid:
+        raise SystemExit("Training stopped to protect the dataset. Fix/move the listed files or rerun with --delete-invalid.")
+    generate_contact_sheet(DATA_DIR, CONTACT_SHEET_PATH)
     train_data, val_data, test_data, class_names = build_datasets()
-    num_classes = len(class_names)
-
-    # 3. Build & summarize model
-    model = build_model(num_classes)
+    model = build_model(len(class_names))
     model.summary()
 
-    # 4. Setup TensorBoard and callbacks
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    tb_callback = callbacks.TensorBoard(log_dir=LOGS_DIR, histogram_freq=1)
-
-    # 5. Train model
-    history = model.fit(
-        train_data,
-        epochs=EPOCHS,
-        validation_data=val_data,
-        callbacks=[tb_callback]
-    )
-
-    # 6. Save plots and run full multiclass evaluation
-    plot_training_history(history)
-    evaluate_and_test(model, test_data, class_names)
-
-    # 7. Persist model artifact
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    training_callbacks = [
+        callbacks.TensorBoard(log_dir=str(LOGS_DIR)),
+        callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+        callbacks.ModelCheckpoint(str(MODEL_PATH), monitor="val_loss", save_best_only=True),
+    ]
+    history = model.fit(train_data, validation_data=val_data, epochs=EPOCHS,
+                        callbacks=training_callbacks, verbose=2)
+    plot_training_history(history, TRAINING_PLOT_PATH)
+    evaluate_model(model, test_data, class_names)
     model.save(MODEL_PATH)
-    print(f"\nModel successfully saved to: {os.path.abspath(MODEL_PATH)}")
+    print(f"Model saved to: {MODEL_PATH}")
 
 
 if __name__ == "__main__":
